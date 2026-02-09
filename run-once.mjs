@@ -36,7 +36,6 @@ function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
 }
 
-// --- NETTOYAGE DU TEXTE ---
 function cleanPostText(text) {
     let t = text || "";
     t = t.replace(/Feed post number \d+/gi, "")
@@ -47,9 +46,8 @@ function cleanPostText(text) {
          .replace(/Like Comment Repost Send/gi, "")
          .replace(/See more/gi, "")
          .replace(/\d+ comments/gi, "")
-         .replace(/\d+ reposts/gi, "");
-    
-    t = t.replace(/\n\s*\n/g, "\n");
+         .replace(/\d+ reposts/gi, "")
+         .replace(/\n\s*\n/g, "\n");
     return t.trim();
 }
 
@@ -132,13 +130,11 @@ function parseNetscapeCookies(text) {
     return cookies;
 }
 
-// --- NEW HELPER: GET LINKS (REMOTE OR LOCAL) ---
 async function getTargetLinks() {
     const remoteUrl = argEnv("LINKS_URL", "");
     const localFile = argEnv("LINKS_FILE", "links.txt");
     let links = [];
 
-    // 1. Try Remote URL first
     if (remoteUrl && remoteUrl.startsWith("http")) {
         console.log(`[Config] Fetching target list from Remote Command Center...`);
         try {
@@ -154,7 +150,6 @@ async function getTargetLinks() {
         }
     }
 
-    // 2. Fallback to Local File
     const localPath = toAbs(localFile);
     if (fs.existsSync(localPath)) {
         console.log(`[Config] Reading local target file: ${localFile}`);
@@ -163,11 +158,10 @@ async function getTargetLinks() {
         return links;
     }
 
-    console.warn("[Config] NO TARGETS FOUND (No LINKS_URL and no links.txt)");
+    console.warn("[Config] NO TARGETS FOUND.");
     return [];
 }
 
-// --- AUTHENTICATION MODULE ---
 async function loginToLinkedIn(page) {
     console.log("[Auth] Initiating LinkedIn Infiltration...");
     const cookiePath = toAbs(argEnv("LINKEDIN_COOKIE_FILE", "linkedin.json"));
@@ -190,7 +184,7 @@ async function loginToLinkedIn(page) {
 
     console.log("[Auth] Verifying Session...");
     try {
-        await page.goto("https://www.linkedin.com/feed/", { waitUntil: "domcontentloaded", timeout: 60000 });
+        await page.goto("https://www.linkedin.com/feed/", { waitUntil: "domcontentloaded", timeout: 45000 }); // Reduced timeout
     } catch (e) {}
     
     const isLoggedIn = await page.evaluate(() => {
@@ -202,27 +196,24 @@ async function loginToLinkedIn(page) {
         return true;
     }
 
-    console.warn("[Auth] ❌ Session Dead. Please refresh cookies locally.");
+    console.warn("[Auth] ❌ Session Dead. Refresh cookies locally.");
     return false;
 }
 
-// --- MODULE: COMPANY POSTS ---
 async function scrapeLinkedInCompanyPosts(page, rawLink, bank) {
     let url = rawLink.trim();
-    if (!url.includes("/posts/")) {
-        url = url.replace(/\/$/, "") + "/posts/?feedView=all";
-    }
+    if (!url.includes("/posts/")) url = url.replace(/\/$/, "") + "/posts/?feedView=all";
     
     console.log(`[LinkedIn-Posts] Targeting: ${url}`);
     const posts = [];
     
     try {
-        await page.goto(url, { waitUntil: "domcontentloaded", timeout: 60000 });
+        await page.goto(url, { waitUntil: "domcontentloaded", timeout: 45000 });
         await safeClick(page, '.modal__dismiss');
         
         await page.evaluate(async () => {
             const distance = 800;
-            for(let i=0; i<8; i++) { 
+            for(let i=0; i<6; i++) { // Reduced scrolls
                 window.scrollBy(0, distance);
                 await new Promise(r => setTimeout(r, 600));
             }
@@ -231,7 +222,7 @@ async function scrapeLinkedInCompanyPosts(page, rawLink, bank) {
         await page.evaluate(() => {
             document.querySelectorAll('.feed-shared-inline-show-more-text__see-more-less-toggle').forEach(b => b.click());
         });
-        await sleep(1500);
+        await sleep(1000);
 
         const extracted = await page.evaluate(() => {
             const nodes = Array.from(document.querySelectorAll('div.feed-shared-update-v2, li.mb-2, div.occludable-update'));
@@ -251,12 +242,7 @@ async function scrapeLinkedInCompanyPosts(page, rawLink, bank) {
                     directLink = `https://www.linkedin.com/feed/update/${urn}/`;
                 }
 
-                return {
-                    text: fullText.trim(),
-                    timeRaw: timeText,
-                    url: directLink,
-                    company: company
-                };
+                return { text: fullText.trim(), timeRaw: timeText, url: directLink, company: company };
             });
         });
 
@@ -264,7 +250,6 @@ async function scrapeLinkedInCompanyPosts(page, rawLink, bank) {
 
         for (const p of extracted) {
             if (!p.text || p.text.length < 5) continue;
-
             const hasCVKeyword = /\b(cv|c\.v|curriculum|resume|envoyer|recrute|opérateur|hassi|job|offre)\b/i.test(p.text);
             const techMatches = matchBank(p.text, bank);
             const hasTechKeyword = techMatches.length > 0;
@@ -286,7 +271,6 @@ async function scrapeLinkedInCompanyPosts(page, rawLink, bank) {
                 let hitTags = [];
                 if (hasCVKeyword) hitTags.push("Recrutement");
                 if (hasTechKeyword) hitTags.push(...techMatches.slice(0, 3));
-
                 posts.push({
                     title: `📢 Post: ${p.company}`,
                     company: p.company,
@@ -299,14 +283,12 @@ async function scrapeLinkedInCompanyPosts(page, rawLink, bank) {
                 });
             }
         }
-        console.log(`[LinkedIn-Posts] Filtered to ${posts.length} relevant posts.`);
     } catch (e) {
         console.warn(`[LinkedIn-Posts] Failed: ${e.message}`);
     }
     return posts;
 }
 
-// --- EXISTING MODULES ---
 async function scrapeGSK(page) {
     const jobs = [];
     try {
@@ -353,7 +335,7 @@ export async function runOnce({ reason = "manual", bankOnly = false } = {}) {
   const STATE_DIR = argEnv("STATE_DIR", process.cwd());
   const SENT_FILE = path.join(STATE_DIR, "sent-urls.json");
 
-  // --- 1. START ALERT ---
+  // SEND START MESSAGE
   if (TELEGRAM_BOT_TOKEN && TELEGRAM_CHAT_ID) {
       await sendTelegramMessage({
           token: TELEGRAM_BOT_TOKEN,
@@ -372,18 +354,32 @@ export async function runOnce({ reason = "manual", bankOnly = false } = {}) {
   const sentState = readJsonSafe(SENT_FILE, { sent: {} });
   const sent = sentState.sent || {};
 
+  // --- MEMORY OPTIMIZATION ARGS ---
   const browser = await puppeteer.launch({
-    headless: "new", 
-    args: ["--no-sandbox", "--disable-setuid-sandbox", "--disable-blink-features=AutomationControlled"],
+    headless: "new",
+    args: [
+      "--no-sandbox",
+      "--disable-setuid-sandbox",
+      "--disable-dev-shm-usage", // CRITICAL FOR RENDER
+      "--disable-accelerated-2d-canvas",
+      "--no-first-run",
+      "--no-zygote",
+      "--single-process", // DANGEROUS BUT SAVES RAM
+      "--disable-gpu",
+      "--disable-features=site-per-process"
+    ],
     executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || undefined,
   });
 
   const page = await browser.newPage();
   await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36');
   await page.setViewport({ width: 1366, height: 768 });
+  
+  // --- AGGRESSIVE BLOCKING ---
   await page.setRequestInterception(true);
   page.on("request", (req) => {
-    if (["image", "font", "media"].includes(req.resourceType())) req.abort();
+    const type = req.resourceType();
+    if (["image", "font", "media", "stylesheet", "other"].includes(type)) req.abort(); // Block CSS too!
     else req.continue();
   });
 
@@ -391,7 +387,7 @@ export async function runOnce({ reason = "manual", bankOnly = false } = {}) {
   const seen = new Set();
   const isAuthenticated = await loginToLinkedIn(page);
 
-  // SCRAPE EMPLOITIC
+  // EMPLOITIC
   for (let p = 1; p <= PAGES; p++) {
       try {
           const items = await scrapeEmploitic(page, EMPLOITIC_URL, p);
@@ -400,11 +396,11 @@ export async function runOnce({ reason = "manual", bankOnly = false } = {}) {
       await sleep(1000);
   }
 
-  // SCRAPE GSK
+  // GSK
   const gskJobs = await scrapeGSK(page);
   gskJobs.forEach(j => { if(!seen.has(j.url)) { seen.add(j.url); allJobs.push(j); }});
 
-  // SCRAPE LINKEDIN POSTS
+  // LINKEDIN
   if (isAuthenticated) {
       for (const link of companyLinks) {
           const posts = await scrapeLinkedInCompanyPosts(page, link, bank);
@@ -412,24 +408,22 @@ export async function runOnce({ reason = "manual", bankOnly = false } = {}) {
               const uniqueId = j.url;
               if(!seen.has(uniqueId)) { seen.add(uniqueId); allJobs.push(j); }
           });
-          await sleep(2000);
+          // Force Garbage Collection hint by clearing array (JS handles it, but good practice)
+          posts.length = 0; 
+          await sleep(1500);
       }
-  } else {
-      console.warn("[WORM-AI] Skipping LinkedIn Posts (Auth Failed)");
   }
 
-  console.log(`[WORM-AI] Total Intelligence Gathered: ${allJobs.length}`);
+  // SORTING
   const candidates = [];
   for (const j of allJobs) {
     if (sent[j.url]) continue;
-
     if (j.source === "GSK") candidates.push({ ...j, hits: ["GSK-Target"], score: 999 });
     else if (j.source === "LinkedIn-Post") {
         let score = 800; 
         if (j.hits && j.hits.length > 0) score = 1200;
         candidates.push({ ...j, score: score });
-    }
-    else {
+    } else {
         const hay = `${j.title} ${j.company} ${j.location}`;
         const hits = matchBank(hay, bank);
         if (hits.length) candidates.push({ ...j, hits, score: hits.length });
@@ -470,9 +464,10 @@ export async function runOnce({ reason = "manual", bankOnly = false } = {}) {
 
   fs.mkdirSync(STATE_DIR, { recursive: true });
   fs.writeFileSync(SENT_FILE, JSON.stringify({ sent }, null, 2), "utf-8");
+
   await browser.close();
 
-  // --- 2. SUMMARY REPORT ---
+  // SEND REPORT MESSAGE
   if (TELEGRAM_BOT_TOKEN && TELEGRAM_CHAT_ID) {
       const summaryMsg = 
         `🏁 <b>Mission Report</b>\n\n` +
@@ -484,7 +479,7 @@ export async function runOnce({ reason = "manual", bankOnly = false } = {}) {
         `• Total Found: ${allJobs.length}\n` +
         `• Relevant Matches: ${candidates.length}\n` +
         `• <b>New Sent: ${sentCount}</b>\n\n` +
-        (sentCount === 0 ? `<i>😴 No new relevant opportunities found this run.</i>` : `<i>🔥 Action required on sent items.</i>`);
+        (sentCount === 0 ? `<i>😴 No new relevant opportunities found.</i>` : `<i>🔥 Action required.</i>`);
 
       await sendTelegramMessage({
           token: TELEGRAM_BOT_TOKEN,
