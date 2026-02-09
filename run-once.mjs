@@ -142,7 +142,9 @@ async function scrapeEmploitic(page, baseUrl, pageNum) {
 // --- CORE EXECUTOR ---
 export async function runOnce({ reason = "manual", bankOnly = false } = {}) {
   const EMPLOITIC_URL = argEnv("SCRAPE_URL", "https://emploitic.com/offres-d-emploi");
-  const PAGES = Number(argEnv("SCRAPE_PAGES", "3"));
+  
+  // 🔥 SET TO 5 PAGES 🔥
+  const PAGES = Number(argEnv("SCRAPE_PAGES", "5"));
   const MAX_SEND = Number(argEnv("MAX_SEND", "15"));
   const KEYWORDS_FILE = argEnv("KEYWORDS_FILE", "keywords.cleaned.json");
   const TELEGRAM_BOT_TOKEN = argEnv("TELEGRAM_BOT_TOKEN", "");
@@ -155,7 +157,7 @@ export async function runOnce({ reason = "manual", bankOnly = false } = {}) {
       await sendTelegramMessage({
           token: TELEGRAM_BOT_TOKEN,
           chatId: TELEGRAM_CHAT_ID,
-          textHtml: `🚀 <b>WORM-AI Initiated</b>\nScanning Emploitic & GSK...`
+          textHtml: `🚀 <b>WORM-AI Initiated</b>\nScanning Emploitic (${PAGES} pages) & GSK...`
       });
   }
 
@@ -168,7 +170,7 @@ export async function runOnce({ reason = "manual", bankOnly = false } = {}) {
   const sentState = readJsonSafe(SENT_FILE, { sent: {} });
   const sent = sentState.sent || {};
 
-  // KEEPING MEMORY OPTIMIZATIONS (Just in case)
+  // MEMORY OPTIMIZED BROWSER LAUNCH
   const browser = await puppeteer.launch({
     headless: "new",
     args: [
@@ -188,7 +190,7 @@ export async function runOnce({ reason = "manual", bankOnly = false } = {}) {
   await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36');
   await page.setViewport({ width: 1366, height: 768 });
   
-  // BLOCK ASSETS TO SAVE BANDWIDTH/RAM
+  // RESOURCE BLOCKING
   await page.setRequestInterception(true);
   page.on("request", (req) => {
     const type = req.resourceType();
@@ -198,7 +200,7 @@ export async function runOnce({ reason = "manual", bankOnly = false } = {}) {
 
   const allJobs = [];
   const seen = new Set();
-
+  
   // 1. EMPLOITIC SCAN
   for (let p = 1; p <= PAGES; p++) {
       try {
@@ -234,8 +236,6 @@ export async function runOnce({ reason = "manual", bankOnly = false } = {}) {
 
   for (const j of toSend) {
     let detailText = ""; 
-    // Emploitic sometimes needs a visit to get full details, but let's skip to save RAM if not needed
-    // or keep it light:
     if (j.source === "GSK") {
          try {
             await page.goto(j.url, { waitUntil: "domcontentloaded", timeout: 15000 });
