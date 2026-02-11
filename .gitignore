@@ -3,10 +3,13 @@ node_modules/
 
 # secrets
 .env
+linkedin*.txt
 
 # local outputs / state
 jobs.json
 seen-urls.json
+sent-urls.json
+follow_progress.json
 keywords.state.json
 *.log
 

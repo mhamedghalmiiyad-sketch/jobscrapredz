@@ -7,6 +7,27 @@ import { fileURLToPath } from 'url';
 // Activate Stealth Mode
 puppeteer.use(StealthPlugin());
 
+// --- 1. AUTO-LOAD .ENV FILE ---
+function loadEnv() {
+    try {
+        const envPath = path.resolve(process.cwd(), '.env');
+        if (fs.existsSync(envPath)) {
+            const content = fs.readFileSync(envPath, 'utf-8');
+            content.split('\n').forEach(line => {
+                const cleanLine = line.trim();
+                if (!cleanLine || cleanLine.startsWith('#')) return;
+                const [key, ...parts] = cleanLine.split('=');
+                if (key) {
+                    const val = parts.join('=').trim().replace(/^["']|["']$/g, '');
+                    if (!process.env[key.trim()]) process.env[key.trim()] = val;
+                }
+            });
+            console.log("[Config] .env loaded.");
+        }
+    } catch (e) { console.error(`[Config] Env load error: ${e.message}`); }
+}
+loadEnv(); 
+
 function argEnv(name, fallback) {
   const v = process.env[name];
   return v == null || v === "" ? fallback : v;
@@ -17,15 +38,7 @@ function toAbs(p) {
 }
 
 function readJsonSafe(file, fallback) {
-  try {
-    return JSON.parse(fs.readFileSync(file, "utf-8"));
-  } catch {
-    return fallback;
-  }
-}
-
-function norm(s) {
-  return String(s || "").toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "").replace(/\s+/g, " ").trim();
+  try { return JSON.parse(fs.readFileSync(file, "utf-8")); } catch { return fallback; }
 }
 
 function escapeHtml(s) {
@@ -36,16 +49,8 @@ function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
 }
 
-function cleanPostText(text) {
-    let t = text || "";
-    t = t.replace(/\n\s*\n/g, "\n");
-    return t.trim();
-}
-
-function pickSnippet(fullText, maxLen = 800) {
-    let t = cleanPostText(fullText);
-    if (t.length > maxLen) t = t.slice(0, maxLen - 1) + "…";
-    return t;
+function norm(s) {
+  return String(s || "").toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "").replace(/\s+/g, " ").trim();
 }
 
 function parseKeywordsFile(filePath) {
@@ -86,10 +91,22 @@ function matchBank(text, bank) {
 }
 
 async function sendTelegramMessage({ token, chatId, textHtml }) {
+  if (!token) { console.error("[Telegram] Token missing!"); return; }
   const url = `https://api.telegram.org/bot${token}/sendMessage`;
   const body = { chat_id: chatId, text: textHtml, parse_mode: "HTML", disable_web_page_preview: true };
-  const r = await fetch(url, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
-  if (!r.ok) console.error(`Telegram error: ${await r.text()}`);
+  
+  try {
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 15000);
+      const r = await fetch(url, { 
+          method: "POST", 
+          headers: { "content-type": "application/json" }, 
+          body: JSON.stringify(body),
+          signal: controller.signal
+      });
+      clearTimeout(timeoutId);
+      if (!r.ok) console.error(`[Telegram] API Error: ${await r.text()}`);
+  } catch (e) { console.error(`[Telegram] Failed: ${e.message}`); }
 }
 
 async function safeClick(page, selector) {
@@ -100,6 +117,145 @@ async function safeClick(page, selector) {
         }
     } catch {}
     return false;
+}
+
+// --- MODULE: HENKEL (STRICT ALGERIA DEFAULT) ---
+async function scrapeHenkel(page, targetCountry = "algeria") {
+    const jobs = [];
+    const countryMap = { 'algeria': 'Algeria', 'israel': 'Israel', 'france': 'France' };
+    const cVal = countryMap[targetCountry.toLowerCase()] || 'Algeria';
+    const url = `https://www.henkel.com/careers/jobs-and-application?f_Country=${encodeURIComponent(cVal)}`;
+    
+    console.log(`[Henkel] Targeting: ${url} (Filter: ${cVal})`);
+
+    // KEYWORDS FOR POST-FILTERING
+    const locationKeywords = targetCountry.toLowerCase() === 'israel' 
+        ? ['israel', 'netanya', 'tel aviv', 'haifa'] 
+        : ['algeria', 'algerie', 'algérie', 'algers', 'dza', 'bouira', 'oran', 'constantine'];
+
+    try {
+        await page.goto(url, { waitUntil: "domcontentloaded", timeout: 90000 });
+        
+        try {
+            const consentBtn = await page.waitForSelector('#accept-recommended-btn-handler, #onetrust-accept-btn-handler', { timeout: 8000 });
+            if (consentBtn) {
+                await consentBtn.click();
+                await sleep(1500); 
+            }
+        } catch {}
+
+        try {
+            await page.waitForSelector('.bab-filters__results-list-result', { timeout: 20000 });
+        } catch {
+            console.warn(`[Henkel] No jobs visible initially.`);
+            return [];
+        }
+
+        // LOAD MORE LOOP
+        let clicks = 0;
+        while (clicks < 5) { // Limit to 5 pages of loading to save time
+            try {
+                const btnVisible = await page.evaluate(() => {
+                    const btn = document.querySelector('.bab-filters__results-loadMore');
+                    return btn && btn.style.display !== 'none' && btn.offsetParent !== null;
+                });
+                if (!btnVisible) break;
+                await page.click('.bab-filters__results-loadMore');
+                await sleep(2500); 
+                clicks++;
+            } catch { break; }
+        }
+
+        const extracted = await page.evaluate(() => {
+            return Array.from(document.querySelectorAll('.bab-filters__results-list-result')).map(node => {
+                const title = node.querySelector('.link-title')?.innerText?.trim() || "Henkel Job";
+                const loc = node.querySelector('.place')?.innerText?.trim() || "";
+                const linkNode = node.querySelector('a');
+                let link = linkNode ? linkNode.getAttribute('href') : null;
+                if (link && !link.startsWith('http')) link = 'https://www.henkel.com' + link;
+                return { title, location: loc, url: link };
+            });
+        });
+
+        const relevantJobs = extracted.filter(j => {
+            const loc = j.location.toLowerCase();
+            return locationKeywords.some(k => loc.includes(k));
+        }).map(j => ({
+            title: j.title,
+            company: "Henkel",
+            location: j.location,
+            url: j.url,
+            posted: "Recent",
+            source: `Henkel-${cVal}`
+        }));
+
+        console.log(`[Henkel] Extracted ${relevantJobs.length} verified jobs.`);
+        jobs.push(...relevantJobs);
+
+    } catch (e) { console.warn(`[Henkel] Error: ${e.message}`); }
+    return jobs;
+}
+
+// --- MODULE: OUEDKNISS (NEW) ---
+async function scrapeOuedkniss(page, maxPages = 10) {
+    const jobs = [];
+    console.log(`[Ouedkniss] Starting scan (Pages 1-${maxPages})...`);
+
+    for (let i = 1; i <= maxPages; i++) {
+        const url = `https://www.ouedkniss.com/offres_demandes_emploi/${i}`;
+        // console.log(`[Ouedkniss] Scanning page ${i}...`);
+        
+        try {
+            await page.goto(url, { waitUntil: "domcontentloaded", timeout: 60000 });
+            
+            // Wait for Vue app to hydrate card list
+            try {
+                await page.waitForSelector('.o-announ-card', { timeout: 10000 });
+            } catch {
+                // If timeout, maybe no results or network lag, skip page
+                continue;
+            }
+
+            const pageJobs = await page.evaluate(() => {
+                const nodes = Array.from(document.querySelectorAll('.o-announ-card'));
+                return nodes.map(node => {
+                    const titleEl = node.querySelector('.o-announ-card-title');
+                    const cityEl = node.querySelector('.o-announ-card-city');
+                    const timeEl = node.querySelector('.o-announ-card-date');
+                    const linkEl = node.closest('a') || node.querySelector('a');
+                    const companyEl = node.closest('.o-announ-card-column')?.nextElementSibling?.querySelector('.text-capitalize');
+
+                    const title = titleEl ? titleEl.innerText.trim() : "";
+                    const location = cityEl ? cityEl.innerText.trim() : "Algérie";
+                    const posted = timeEl ? timeEl.innerText.trim() : "Recent";
+                    const company = companyEl ? companyEl.innerText.trim() : "Ouedkniss Annonce";
+
+                    let link = linkEl ? linkEl.getAttribute('href') : null;
+                    if (link && !link.startsWith('http')) link = 'https://www.ouedkniss.com' + link;
+
+                    return {
+                        title: title,
+                        company: company, 
+                        location: location,
+                        url: link,
+                        posted: posted,
+                        source: "Ouedkniss"
+                    };
+                });
+            });
+
+            // Basic cleanup of empty entries
+            const validJobs = pageJobs.filter(j => j.title && j.url);
+            jobs.push(...validJobs);
+            await sleep(1000); // Polite delay
+
+        } catch (e) {
+            console.warn(`[Ouedkniss] Error page ${i}: ${e.message}`);
+        }
+    }
+    
+    console.log(`[Ouedkniss] Total raw jobs found: ${jobs.length}`);
+    return jobs;
 }
 
 // --- MODULE: GSK ---
@@ -117,8 +273,7 @@ async function scrapeGSK(page) {
              posted: "Recent",
              source: "GSK"
         })).filter(x => x.url.includes('/jobs/') && x.title.length>3));
-        const u = new Map(); items.forEach(i => u.set(i.url, i));
-        jobs.push(...u.values());
+        jobs.push(...items);
     } catch (e) {}
     return jobs;
 }
@@ -141,11 +296,19 @@ async function scrapeEmploitic(page, baseUrl, pageNum) {
 
 // --- CORE EXECUTOR ---
 export async function runOnce({ reason = "manual", bankOnly = false } = {}) {
-  const EMPLOITIC_URL = argEnv("SCRAPE_URL", "https://emploitic.com/offres-d-emploi");
+  // ARGS
+  const args = process.argv.slice(2);
+  const flagHenkelOnly = args.includes('-henkel');
+  const flagOuedknissOnly = args.includes('-ouedkniss');
+  const flagReset = args.includes('-reset');
   
-  // 🔥 SET TO 5 PAGES 🔥
+  // COUNTRY LOGIC
+  let targetCountry = 'algeria'; // Default to Algeria for Production
+  if (args.includes('-israel')) targetCountry = 'israel'; // Override if specified
+  
+  const EMPLOITIC_URL = argEnv("SCRAPE_URL", "https://emploitic.com/offres-d-emploi");
   const PAGES = Number(argEnv("SCRAPE_PAGES", "5"));
-  const MAX_SEND = Number(argEnv("MAX_SEND", "15"));
+  const MAX_SEND = Number(argEnv("MAX_SEND", "20")); // Increased slightly
   const KEYWORDS_FILE = argEnv("KEYWORDS_FILE", "keywords.cleaned.json");
   const TELEGRAM_BOT_TOKEN = argEnv("TELEGRAM_BOT_TOKEN", "");
   const TELEGRAM_CHAT_ID = argEnv("TELEGRAM_CHAT_ID", "");
@@ -154,105 +317,123 @@ export async function runOnce({ reason = "manual", bankOnly = false } = {}) {
 
   // SEND START MESSAGE
   if (TELEGRAM_BOT_TOKEN && TELEGRAM_CHAT_ID) {
+      let modeText = "Full Scan (Algeria)";
+      if (flagHenkelOnly) modeText = `Henkel Only (${targetCountry.toUpperCase()})`;
+      if (flagOuedknissOnly) modeText = `Ouedkniss Only`;
+      
       await sendTelegramMessage({
           token: TELEGRAM_BOT_TOKEN,
           chatId: TELEGRAM_CHAT_ID,
-          textHtml: `🚀 <b>WORM-AI Initiated</b>\nScanning Emploitic (${PAGES} pages) & GSK...`
+          textHtml: `🚀 <b>WORM-AI Started</b>\nMode: ${modeText}\nReset: ${flagReset}`
       });
   }
 
+  // KEYWORDS
   const seeds = String(argEnv("KEYWORD_SEEDS", "automation,automatisme,maintenance,electricite,électricité,électrique,instrumentation,plc,automate,scada,hmi,ingénieur,technicien")).split(",").map(s => s.trim()).filter(Boolean);
   const allKeywords = parseKeywordsFile(toAbs(KEYWORDS_FILE));
   const bank = makeKeywordBank(allKeywords, seeds);
 
-  if (bankOnly) return { ok: true, reason, bankSize: bank.length };
+  // MEMORY
+  let sent = {};
+  if (!flagReset) {
+      const sentState = readJsonSafe(SENT_FILE, { sent: {} });
+      sent = sentState.sent || {};
+  } else {
+      console.log("[Config] Memory Reset Active.");
+  }
 
-  const sentState = readJsonSafe(SENT_FILE, { sent: {} });
-  const sent = sentState.sent || {};
-
-  // MEMORY OPTIMIZED BROWSER LAUNCH
+  // BROWSER
   const browser = await puppeteer.launch({
     headless: "new",
-    args: [
-      "--no-sandbox",
-      "--disable-setuid-sandbox",
-      "--disable-dev-shm-usage",
-      "--disable-accelerated-2d-canvas",
-      "--no-first-run",
-      "--no-zygote",
-      "--single-process",
-      "--disable-gpu"
-    ],
-    executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || undefined,
+    args: ["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage", "--disable-gpu", "--disable-software-rasterizer"],
+    executablePath: process.env.PUPPETEER_EXECUTABLE_PATH
   });
 
   const page = await browser.newPage();
-  await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36');
   await page.setViewport({ width: 1366, height: 768 });
   
-  // RESOURCE BLOCKING
+  // Resource Blocking
   await page.setRequestInterception(true);
   page.on("request", (req) => {
     const type = req.resourceType();
-    if (["image", "font", "media", "stylesheet"].includes(type)) req.abort();
+    // Allow scripts for Ouedkniss (Vue.js needs them)
+    if (["image", "font", "media"].includes(type)) req.abort();
     else req.continue();
   });
 
   const allJobs = [];
   const seen = new Set();
-  
-  // 1. EMPLOITIC SCAN
-  for (let p = 1; p <= PAGES; p++) {
-      try {
-          const items = await scrapeEmploitic(page, EMPLOITIC_URL, p);
-          items.forEach(j => { if(!seen.has(j.url)) { seen.add(j.url); allJobs.push(j); }});
-      } catch {}
-      await sleep(1000);
-  }
 
-  // 2. GSK SCAN
-  const gskJobs = await scrapeGSK(page);
-  gskJobs.forEach(j => { if(!seen.has(j.url)) { seen.add(j.url); allJobs.push(j); }});
+  // --- EXECUTION LOGIC ---
+  if (flagHenkelOnly) {
+      // 1. HENKEL ONLY MODE
+      const hJobs = await scrapeHenkel(page, targetCountry);
+      hJobs.forEach(j => { if(!seen.has(j.url)) { seen.add(j.url); allJobs.push(j); }});
+  
+  } else if (flagOuedknissOnly) {
+      // 2. OUEDKNISS ONLY MODE
+      const oJobs = await scrapeOuedkniss(page, 10); // 10 Pages
+      oJobs.forEach(j => { if(!seen.has(j.url)) { seen.add(j.url); allJobs.push(j); }});
+
+  } else {
+      // 3. FULL MODE (DEFAULT ALGERIA)
+      console.log(`[Mode] Running Full Scan for ALGERIA...`);
+      
+      // A. Emploitic
+      for (let p = 1; p <= PAGES; p++) {
+          try {
+              const items = await scrapeEmploitic(page, EMPLOITIC_URL, p);
+              items.forEach(j => { if(!seen.has(j.url)) { seen.add(j.url); allJobs.push(j); }});
+          } catch {}
+          await sleep(1000);
+      }
+      
+      // B. GSK
+      const gskJobs = await scrapeGSK(page);
+      gskJobs.forEach(j => { if(!seen.has(j.url)) { seen.add(j.url); allJobs.push(j); }});
+      
+      // C. Henkel (Forced Algeria in standard mode)
+      const henkelJobs = await scrapeHenkel(page, "algeria");
+      henkelJobs.forEach(j => { if(!seen.has(j.url)) { seen.add(j.url); allJobs.push(j); }});
+
+      // D. Ouedkniss
+      const oJobs = await scrapeOuedkniss(page, 10);
+      oJobs.forEach(j => { if(!seen.has(j.url)) { seen.add(j.url); allJobs.push(j); }});
+  }
 
   console.log(`[WORM-AI] Total Intelligence Gathered: ${allJobs.length}`);
   
-  // FILTER & RANK
+  // --- FILTERING & MATCHING ---
   const candidates = [];
   for (const j of allJobs) {
     if (sent[j.url]) continue;
 
-    if (j.source === "GSK") {
-        candidates.push({ ...j, hits: ["GSK-Target"], score: 999 });
-    } else {
+    // DIRECT TARGETS (Skip keyword check for specific company portals)
+    if (j.source && (j.source.startsWith("Henkel") || j.source === "GSK")) {
+        candidates.push({ ...j, score: 999 });
+    } 
+    // GENERAL SOURCES (Emploitic, Ouedkniss) -> REQUIRE KEYWORD MATCH
+    else {
         const hay = `${j.title} ${j.company} ${j.location}`;
         const hits = matchBank(hay, bank);
-        if (hits.length) candidates.push({ ...j, hits, score: hits.length });
+        
+        if (hits.length > 0) {
+            candidates.push({ ...j, score: hits.length });
+        }
     }
   }
 
+  // Sort by score (Company targets first, then keyword density)
   candidates.sort((a, b) => b.score - a.score);
   const toSend = candidates.slice(0, MAX_SEND);
   let sentCount = 0;
 
   for (const j of toSend) {
-    let detailText = ""; 
-    if (j.source === "GSK") {
-         try {
-            await page.goto(j.url, { waitUntil: "domcontentloaded", timeout: 15000 });
-            detailText = await page.evaluate(() => document.querySelector(".job-description")?.innerText || "");
-        } catch {}
-    }
-
-    const snippet = pickSnippet(detailText || j.title, 600);
-    const matched = (j.hits || []).slice(0, 6).join(", ");
-    
     const msg =
-      `<b>${escapeHtml(j.title || "Nouvelle Offre Détectée")}</b>\n` +
-      `🏢 <b>${escapeHtml(j.company || "")}</b>\n` +
-      `📍 ${escapeHtml(j.location || "Algérie")}\n` +
+      `<b>${escapeHtml(j.title || "Nouvelle Offre")}</b>\n` +
+      `🏢 <b>${escapeHtml(j.company || "Anonyme")}</b>\n` +
+      `📍 ${escapeHtml(j.location || "")}\n` +
       `🕒 ${escapeHtml(j.posted || "")}\n\n` +
-      (matched ? `🔑 <b>Tags:</b> ${escapeHtml(matched)}\n\n` : "") +
-      `📄 <b>Résumé:</b>\n<i>${escapeHtml(snippet)}</i>\n\n` +
       `<a href="${escapeHtml(j.url)}">👉 CLIQUEZ ICI POUR POSTULER</a>`;
 
     await sendTelegramMessage({ token: TELEGRAM_BOT_TOKEN, chatId: TELEGRAM_CHAT_ID, textHtml: msg });
@@ -266,14 +447,12 @@ export async function runOnce({ reason = "manual", bankOnly = false } = {}) {
 
   await browser.close();
 
-  // FINAL REPORT
   if (TELEGRAM_BOT_TOKEN && TELEGRAM_CHAT_ID) {
       const summaryMsg = 
-        `🏁 <b>Mission Report</b>\n\n` +
-        `🔎 <b>Sources:</b> Emploitic (${PAGES} pg) + GSK\n` +
-        `📊 <b>Found:</b> ${allJobs.length} total\n` +
-        `✅ <b>Matches:</b> ${candidates.length}\n` +
-        `📩 <b>Sent:</b> ${sentCount}`;
+        `🏁 <b>Report</b>\n` +
+        `🔎 Sources: ${allJobs.length}\n` +
+        `✅ Matches: ${candidates.length}\n` +
+        `📩 Sent: ${sentCount}`;
 
       await sendTelegramMessage({
           token: TELEGRAM_BOT_TOKEN,
@@ -281,8 +460,6 @@ export async function runOnce({ reason = "manual", bankOnly = false } = {}) {
           textHtml: summaryMsg
       });
   }
-
-  return { ok: true, scanned: allJobs.length, matched: candidates.length, sent: sentCount };
 }
 
 if (process.argv[1] === fileURLToPath(import.meta.url)) runOnce({ reason: 'manual_cli' });
